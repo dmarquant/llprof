@@ -1,10 +1,14 @@
 const std = @import("std");
 const linux = std.os.linux;
 
+const procmaps = @import("procmaps.zig");
+
 
 const PerfSampler = struct {
     cpu: u64,
     fd: std.posix.fd_t,
+    page_size: usize,
+    ring_buffer_size: usize,
     buffer: []u8
 };
 
@@ -15,6 +19,43 @@ fn openPid(pid: i32) !std.posix.fd_t {
     } else {
         return error.PidfOpenFailed;
     }
+}
+    
+var first = true;
+var global_pid: i32 = 0;
+
+fn writeSamples(sampler: PerfSampler, writer: *std.Io.Writer, io: std.Io, gpa: std.mem.Allocator) !void {
+    var metadata = std.mem.bytesAsValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
+    const sampledata = sampler.buffer[sampler.page_size .. ];
+
+    std.debug.print("Woken up to write samples for CPU({}. {} bytes available\n", .{
+        sampler.cpu,
+        metadata.data_head - metadata.data_tail
+    });
+
+    var tail = metadata.data_tail;
+    while (tail < metadata.data_head) {
+        if (first) {
+            // TODO: Remove this debug output
+            // TODO: Attach region information to the samples
+            first = false;
+            var regions = try procmaps.readExecutableRegions(io, gpa, global_pid);
+            defer regions.deinit(gpa);
+
+            for (regions.regions) |*region| {
+                std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
+            }
+        }
+        const readp = tail % sampler.ring_buffer_size;
+        const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
+        const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
+
+        try writer.print("{},0x{x}\n", .{ sampler.cpu, ip });
+
+        tail += header.size;
+    }
+    // notify the kernel about that data was read
+    metadata.data_tail = tail;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -28,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const pid: i32 = @intCast(rc);
+    global_pid = pid;
 
     if (pid == 0) {
         std.debug.print("Child!\n", .{});
@@ -39,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
 
         std.debug.print("Child ready to execute!\n", .{});
 
+        // TODO: Take this seriously ;)
         var argv = try init.gpa.allocSentinel(?[*:0]const u8, 1, null);
         argv[0] = "./test";
 
@@ -88,11 +131,20 @@ pub fn main(init: std.process.Init) !void {
     };
     _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, childfd, &epoll_event);
 
+    const page_size = std.heap.pageSize();
+
+    // Must be a power of 2 multiple of the page size
+    const ring_buffer_size = page_size * 128;
+
+    // One extra page is needed for the metadata (head, tail)
+    const mmap_size = ring_buffer_size + page_size;
 
     for (samplers, 0..) |*sampler, cpu| {
         sampler.cpu = cpu;
         sampler.fd = try std.posix.perf_event_open(&perf_attr, pid, @intCast(cpu), -1, 0);
-        sampler.buffer = try std.posix.mmap(null, 528384, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, sampler.fd, 0);
+        sampler.buffer = try std.posix.mmap(null, mmap_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, sampler.fd, 0);
+        sampler.page_size = page_size;
+        sampler.ring_buffer_size = ring_buffer_size;
 
         var perf_epoll_event: linux.epoll_event = .{
             .events = linux.EPOLL.IN,
@@ -103,6 +155,14 @@ pub fn main(init: std.process.Init) !void {
         _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, sampler.fd, &perf_epoll_event);
     }
 
+
+    var cwd = std.Io.Dir.cwd();
+    var outFile = try cwd.createFile(init.io, "./samples.txt", .{});
+
+    
+    var outbuffer: [4096 * 4]u8 = undefined;
+    var fwriter = outFile.writer(init.io, &outbuffer);
+    var writer = &fwriter.interface;
 
 
     // Signal child to continue with execve
@@ -124,61 +184,18 @@ pub fn main(init: std.process.Init) !void {
 
                 break :outer;
             } else {
+                // Before the process closes epoll triggers all of the events 
+                // TODO: Find documentation for that
                 for (samplers) |sampler| {
                     if (sampler.fd == events[i].data.fd) {
-                        // TODO: put this in a function :)
-                        var metadata = std.mem.bytesAsValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
-                        const sampledata = sampler.buffer[4096 .. ];
-                
-                        std.debug.print("Woken up to write samples. {} bytes available\n", .{
-                            metadata.data_head - metadata.data_tail
-                        });
-
-                        var tail = metadata.data_tail;
-                        while (tail < metadata.data_head) {
-                            // TODO: Properly setup this frame size
-                            const readp = tail % (528384 - 4096);
-                            const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
-                            const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
-
-                            // TODO: write to file
-                            _ = ip;
-                            //std.debug.print("IP {x}\n", .{ ip });
-
-
-                            tail += header.size;
-                        }
-                        metadata.data_tail = tail;
+                        try writeSamples(sampler, writer, init.io, init.gpa);
                     }
                 }
             }
         }
     }
 
-    // TODO: Get the actual page size
     // TODO: Configure watermark to get woken up? Seems to do it automatically
-    for (samplers) |sampler| {
-        const metadata = std.mem.bytesToValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
-
-        std.debug.print("Have {} bytes of samples for CPU {}\n", .{ metadata.data_head - metadata.data_tail, sampler.cpu });
-
-        const sampledata = sampler.buffer[4096 .. ];
-
-        var tail = metadata.data_tail;
-        while (tail < metadata.data_head) {
-            // TODO: Properly setup this frame size
-            const readp = tail % (528384 - 4096);
-            const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
-            const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
-
-            // TODO: write to file
-            _ = ip;
-            //std.debug.print("IP {x}\n", .{ ip });
-
-
-            tail += header.size;
-        }
-
-    }
-    
+    try writer.flush();
+    outFile.close(init.io);    
 }

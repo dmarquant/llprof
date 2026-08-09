@@ -36,7 +36,7 @@ pub fn readExecutableRegions(io: std.Io, gpa: std.mem.Allocator, pid: i32) !Mapp
     const mmap_path = try std.fmt.allocPrint(gpa, "/proc/{}/maps", .{pid});
     defer gpa.free(mmap_path);
 
-    var file = try std.Io.Dir.openFileAbsolute(io, "/proc/6029/maps", .{});
+    var file = try std.Io.Dir.openFileAbsolute(io, mmap_path, .{});
 
     var buffer: [4096]u8 = undefined;
     var file_reader = file.reader(io, &buffer);
@@ -119,11 +119,3 @@ pub fn readExecutableRegions(io: std.Io, gpa: std.mem.Allocator, pid: i32) !Mapp
     return .{ .regions = try regions.toOwnedSlice(gpa) };
 }
 
-pub fn main(init: std.process.Init) !void {
-    var regions = try readExecutableRegions(init.io, init.gpa, 6029);
-    defer regions.deinit(init.gpa);
-
-    for (regions.regions) |*region| {
-        std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
-    }
-}
