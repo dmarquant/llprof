@@ -1,9 +1,27 @@
 const std = @import("std");
 const linux = std.os.linux;
+const ArrayList = std.ArrayList;
 
 const procmaps = @import("procmaps.zig");
 
+const Sample = struct {
+    cpu: u32,
+    tid: u32,
+    time_ns: u64,
+    cc_len: u32
+};
 
+const Samples = struct {
+    samples: ArrayList(Sample) = .empty,
+    ips: ArrayList(u64) = .empty,
+
+    fn deinit(samples: *Samples, gpa: std.mem.Allocator) void {
+        samples.samples.deinit(gpa);
+        samples.ips.deinit(gpa);
+    }
+};
+
+// Basically a perf_event sampling data for a single cpu
 const PerfSampler = struct {
     cpu: u64,
     fd: std.posix.fd_t,
@@ -56,10 +74,7 @@ fn openPid(pid: i32) !std.posix.fd_t {
     }
 }
     
-var first = true;
-var global_pid: i32 = 0;
-
-fn writeSamples(sampler: PerfSampler, writer: *std.Io.Writer, io: std.Io, gpa: std.mem.Allocator) !void {
+fn recordSamples(sampler: PerfSampler, samples: *Samples, gpa: std.mem.Allocator) !void {
     var metadata = std.mem.bytesAsValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
     const sampledata = sampler.buffer[sampler.page_size .. ];
 
@@ -70,19 +85,6 @@ fn writeSamples(sampler: PerfSampler, writer: *std.Io.Writer, io: std.Io, gpa: s
 
     var tail = metadata.data_tail;
     while (tail < metadata.data_head) {
-        if (first) {
-            // TODO: Remove this debug output
-            // TODO: Attach region information to the samples
-            first = false;
-            var regions = try procmaps.readExecutableRegions(io, gpa, global_pid);
-            defer regions.deinit(gpa);
-
-            for (regions.regions) |*region| {
-                std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
-            }
-        }
-
-
         // Can the ring buffer wrap around?
         const readp = tail % sampler.ring_buffer_size;
         var reader = RingBufferReader.init(sampledata[readp ..], sampledata[0 ..]);
@@ -94,15 +96,32 @@ fn writeSamples(sampler: PerfSampler, writer: *std.Io.Writer, io: std.Io, gpa: s
         const tid = try reader.takeInt(u32);
         const time = try reader.takeInt(u64);
         const size_callchain = try reader.takeInt(u64);
-        try writer.print("{},{},{},0x{x}-{}\n  ", .{ sampler.cpu, tid, time, ip, size_callchain });
+
+        const sample = Sample {
+            .cpu = @intCast(sampler.cpu),
+            .tid = tid,
+            .time_ns = time,
+            .cc_len = @intCast(size_callchain + 1), // one more for the current ip
+        };
+
+        try samples.samples.append(gpa, sample);
+
+        // TODO: Samples should be written into a growing array
+        // To save space I could store between the samples what has actually changed
+        // The time obviously always changes. Thread id and cpu will remain equal for a long time.
+        // The callchain will also remain (at least) partially the same for consecutive samples.
+        // My idea would be to store a bit for cpu and tid respectively if they differ from the
+        // previous sample. And for the callchain I could store the number of samples that are
+        // equal. Maybe separate arrays would also make sense.
         for (0 .. size_callchain) |_| {
+            // TODO: Kernel/userspace transitions
             const cc_ip = try reader.takeInt(u64);
-            try writer.print("0x{x}-", .{ cc_ip });
+            try samples.ips.append(gpa, cc_ip);
         }
-        try writer.print("\n", .{});
+
+        try samples.ips.append(gpa, ip);
 
         _ = pid;
-
 
         tail += header.size;
     }
@@ -121,7 +140,6 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const pid: i32 = @intCast(rc);
-    global_pid = pid;
 
     if (pid == 0) {
         std.debug.print("Child!\n", .{});
@@ -145,11 +163,10 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Forked at {}!\n", .{pid});
 
+    // TODO: With clone I think there is an option to get the fd immediately
     const childfd = try openPid(pid);
 
     _ = linux.close(pipes[0]);
-    try init.io.sleep(std.Io.Duration.fromMilliseconds(200), .real);
-
 
     var perf_attr = linux.perf_event_attr{
         .type = .HARDWARE,
@@ -208,19 +225,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
 
-    var cwd = std.Io.Dir.cwd();
-    var outFile = try cwd.createFile(init.io, "./samples.txt", .{});
-
-    
-    var outbuffer: [4096 * 4]u8 = undefined;
-    var fwriter = outFile.writer(init.io, &outbuffer);
-    var writer = &fwriter.interface;
-
-
     // Signal child to continue with execve
     _ = linux.close(pipes[1]);
 
 
+    var samples = Samples{};
+    defer samples.deinit(init.gpa);
+
+    var first = true;
     var events: [128]linux.epoll_event = undefined;
     outer: while (true) {
         const nfds = linux.epoll_wait(epoll_fd, &events, events.len, -1);
@@ -230,16 +242,54 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Process {} has terminated\n", .{pid});
                 break :outer;
             } else {
+                if (first) {
+                    // TODO: Remove this debug output
+                    // TODO: Attach region information to the samples
+                    first = false;
+                    var regions = try procmaps.readExecutableRegions(init.io, init.gpa, pid);
+                    defer regions.deinit(init.gpa);
+
+                    for (regions.regions) |*region| {
+                        std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
+                    }
+                }
+
+
                 // Before the process closes epoll triggers all of the events 
                 // TODO: Find documentation for that
                 for (samplers) |sampler| {
                     if (sampler.fd == events[i].data.fd) {
-                        try writeSamples(sampler, writer, init.io, init.gpa);
+                        try recordSamples(sampler, &samples, init.gpa);
                     }
                 }
             }
         }
     }
+
+    var cwd = std.Io.Dir.cwd();
+    var outFile = try cwd.createFile(init.io, "./samples.txt", .{});
+
+    
+    var outbuffer: [4096 * 4]u8 = undefined;
+    var fwriter = outFile.writer(init.io, &outbuffer);
+    var writer = &fwriter.interface;
+
+    var ip_ix: usize = 0;
+    for (samples.samples.items) |sample| {
+        try writer.print("{},{},{},", .{ sample.cpu, sample.tid, sample.time_ns });
+        for (0 .. sample.cc_len) |i| {
+            if (i + 1 == sample.cc_len) {
+                try writer.print("{x}\n", .{ samples.ips.items[ip_ix] });
+            } else {
+                try writer.print("{x}>", .{ samples.ips.items[ip_ix] });
+            }
+            ip_ix += 1;
+        }
+    }
+
+
+    const memory_usage = samples.samples.items.len * @sizeOf(Sample) + samples.ips.items.len * 8;
+    std.debug.print("Storing {} samples takes {} bytes\n", .{ samples.samples.items.len, memory_usage });
 
     // TODO: Configure watermark to get woken up? Seems to do it automatically
     try writer.flush();
