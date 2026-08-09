@@ -12,6 +12,41 @@ const PerfSampler = struct {
     buffer: []u8
 };
 
+const RingBufferReader = struct {
+    first: std.Io.Reader,
+    second: std.Io.Reader,
+
+    fn init(s1: []u8, s2: []u8) RingBufferReader {
+        const r1 = std.Io.Reader.fixed(s1);
+        const r2 = std.Io.Reader.fixed(s2);
+        return .{
+            .first = r1,
+            .second = r2,
+        };
+    }
+
+    // maybe I could provide a reader interface, but I don't want to bother with it (also it needs another buffer)
+    fn takeStruct(r: *RingBufferReader, comptime T: type) std.Io.Reader.Error!T {
+        // NOTE: This only handles values correctly that do not cross across the ring buffer boundary
+        // Currently I am reading always in chunks of 8bytes, therefore this will not be a problem
+        // with the buffer being a multiple of the page size, but probably I could assert that this
+        // is the case here
+        if (r.first.takeStruct(T, .native)) |s| {
+            return s;
+        } else |_| {
+            return r.second.takeStruct(T, .native);
+        }
+    }
+
+    fn takeInt(r: *RingBufferReader, comptime T: type) std.Io.Reader.Error!T {
+        if (r.first.takeInt(T, .native)) |s| {
+            return s;
+        } else |_| {
+            return r.second.takeInt(T, .native);
+        }
+    }
+};
+
 fn openPid(pid: i32) !std.posix.fd_t {
     const rc = linux.pidfd_open(pid, 0);
     if (linux.errno(rc) == .SUCCESS) {
@@ -46,11 +81,28 @@ fn writeSamples(sampler: PerfSampler, writer: *std.Io.Writer, io: std.Io, gpa: s
                 std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
             }
         }
-        const readp = tail % sampler.ring_buffer_size;
-        const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
-        const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
 
-        try writer.print("{},0x{x}\n", .{ sampler.cpu, ip });
+
+        // Can the ring buffer wrap around?
+        const readp = tail % sampler.ring_buffer_size;
+        var reader = RingBufferReader.init(sampledata[readp ..], sampledata[0 ..]);
+
+        const header = try reader.takeStruct(linux.perf_event_header);
+
+        const ip = try reader.takeInt(u64);
+        const pid = try reader.takeInt(u32);
+        const tid = try reader.takeInt(u32);
+        const time = try reader.takeInt(u64);
+        const size_callchain = try reader.takeInt(u64);
+        try writer.print("{},{},{},0x{x}-{}\n  ", .{ sampler.cpu, tid, time, ip, size_callchain });
+        for (0 .. size_callchain) |_| {
+            const cc_ip = try reader.takeInt(u64);
+            try writer.print("0x{x}-", .{ cc_ip });
+        }
+        try writer.print("\n", .{});
+
+        _ = pid;
+
 
         tail += header.size;
     }
@@ -103,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
         .type = .HARDWARE,
         .config = 0, // PERF_COUNT_HW_CPU_CYCLES
         .sample_period_or_freq = 4000,
-        .sample_type = linux.PERF.SAMPLE.IP,
+        .sample_type = linux.PERF.SAMPLE.IP | linux.PERF.SAMPLE.TID | linux.PERF.SAMPLE.TIME | linux.PERF.SAMPLE.CALLCHAIN,
 
         .flags = .{
             .disabled = true,
@@ -176,12 +228,6 @@ pub fn main(init: std.process.Init) !void {
         for (0 .. nfds) |i| {
             if (events[i].data.fd == childfd) {
                 std.debug.print("Process {} has terminated\n", .{pid});
-
-                var buf: [4096]u8 = undefined;
-                var stdin_reader = std.Io.File.stdin().reader(init.io, &buf);
-                const r = &stdin_reader.interface;
-                _ = try r.takeByte();
-
                 break :outer;
             } else {
                 // Before the process closes epoll triggers all of the events 
