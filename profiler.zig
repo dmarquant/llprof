@@ -8,10 +8,20 @@ const PerfSampler = struct {
     buffer: []u8
 };
 
+fn openPid(pid: i32) !std.posix.fd_t {
+    const rc = linux.pidfd_open(pid, 0);
+    if (linux.errno(rc) == .SUCCESS) {
+        return @intCast(rc);
+    } else {
+        return error.PidfOpenFailed;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var pipes: [2]i32 = undefined;
     _ = linux.pipe(&pipes); // TODO: Handle error
 
+    // TODO: Check the clone syscall. perf is using that
     const rc = linux.fork();
     if (linux.errno(rc) != .SUCCESS) {
         std.debug.print("Failed to fork\n", .{});
@@ -40,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Forked at {}!\n", .{pid});
 
+    const childfd = try openPid(pid);
+
     _ = linux.close(pipes[0]);
     try init.io.sleep(std.Io.Duration.fromMilliseconds(200), .real);
 
@@ -66,23 +78,85 @@ pub fn main(init: std.process.Init) !void {
     const samplers = try init.gpa.alloc(PerfSampler, numCpus);
     defer init.gpa.free(samplers);
 
+    // TODO: Error checking
+    const epoll_fd: i32 = @intCast(linux.epoll_create1(0));
+    var epoll_event: linux.epoll_event = .{
+        .events = linux.EPOLL.IN,
+        .data = .{
+            .fd = childfd
+        }
+    };
+    _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, childfd, &epoll_event);
+
+
     for (samplers, 0..) |*sampler, cpu| {
         sampler.cpu = cpu;
         sampler.fd = try std.posix.perf_event_open(&perf_attr, pid, @intCast(cpu), -1, 0);
         sampler.buffer = try std.posix.mmap(null, 528384, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, sampler.fd, 0);
+
+        var perf_epoll_event: linux.epoll_event = .{
+            .events = linux.EPOLL.IN,
+            .data = .{
+                .fd = sampler.fd
+            }
+        };
+        _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, sampler.fd, &perf_epoll_event);
     }
+
+
 
     // Signal child to continue with execve
     _ = linux.close(pipes[1]);
 
 
-    var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0);
+    var events: [128]linux.epoll_event = undefined;
+    outer: while (true) {
+        const nfds = linux.epoll_wait(epoll_fd, &events, events.len, -1);
+
+        for (0 .. nfds) |i| {
+            if (events[i].data.fd == childfd) {
+                std.debug.print("Process {} has terminated\n", .{pid});
+
+                var buf: [4096]u8 = undefined;
+                var stdin_reader = std.Io.File.stdin().reader(init.io, &buf);
+                const r = &stdin_reader.interface;
+                _ = try r.takeByte();
+
+                break :outer;
+            } else {
+                for (samplers) |sampler| {
+                    if (sampler.fd == events[i].data.fd) {
+                        // TODO: put this in a function :)
+                        var metadata = std.mem.bytesAsValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
+                        const sampledata = sampler.buffer[4096 .. ];
+                
+                        std.debug.print("Woken up to write samples. {} bytes available\n", .{
+                            metadata.data_head - metadata.data_tail
+                        });
+
+                        var tail = metadata.data_tail;
+                        while (tail < metadata.data_head) {
+                            // TODO: Properly setup this frame size
+                            const readp = tail % (528384 - 4096);
+                            const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
+                            const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
+
+                            // TODO: write to file
+                            _ = ip;
+                            //std.debug.print("IP {x}\n", .{ ip });
+
+
+                            tail += header.size;
+                        }
+                        metadata.data_tail = tail;
+                    }
+                }
+            }
+        }
+    }
 
     // TODO: Get the actual page size
-    // TODO: Consider actual ringbufer structure (modulo of size)
-    // TODO: Use epoll or similar to wait for events
-    // TODO: Configure watermark to get woken up
+    // TODO: Configure watermark to get woken up? Seems to do it automatically
     for (samplers) |sampler| {
         const metadata = std.mem.bytesToValue(linux.perf_event_mmap_page, sampler.buffer[0 .. @sizeOf(linux.perf_event_mmap_page)]);
 
@@ -92,16 +166,19 @@ pub fn main(init: std.process.Init) !void {
 
         var tail = metadata.data_tail;
         while (tail < metadata.data_head) {
-            const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[tail .. tail + @sizeOf(linux.perf_event_header)]);
-            const ip = std.mem.bytesToValue(u64, sampledata[tail + @sizeOf(linux.perf_event_header) .. tail + header.size]);
+            // TODO: Properly setup this frame size
+            const readp = tail % (528384 - 4096);
+            const header = std.mem.bytesToValue(linux.perf_event_header, sampledata[readp .. readp + @sizeOf(linux.perf_event_header)]);
+            const ip = std.mem.bytesToValue(u64, sampledata[readp + @sizeOf(linux.perf_event_header) .. readp + header.size]);
 
-            std.debug.print("IP {x}\n", .{ ip });
+            // TODO: write to file
+            _ = ip;
+            //std.debug.print("IP {x}\n", .{ ip });
+
 
             tail += header.size;
         }
 
     }
-
-    std.debug.print("Child done: {}\n", .{status});
     
 }
