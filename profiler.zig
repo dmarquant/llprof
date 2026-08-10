@@ -232,7 +232,9 @@ pub fn main(init: std.process.Init) !void {
     var samples = Samples{};
     defer samples.deinit(init.gpa);
 
-    var first = true;
+    var mapped_regions: ?procmaps.MappedRegions = null;
+    defer if (mapped_regions) |*regions| regions.deinit(init.gpa);
+
     var events: [128]linux.epoll_event = undefined;
     outer: while (true) {
         const nfds = linux.epoll_wait(epoll_fd, &events, events.len, -1);
@@ -242,18 +244,11 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Process {} has terminated\n", .{pid});
                 break :outer;
             } else {
-                if (first) {
+                if (mapped_regions == null) {
                     // TODO: Remove this debug output
                     // TODO: Attach region information to the samples
-                    first = false;
-                    var regions = try procmaps.readExecutableRegions(init.io, init.gpa, pid);
-                    defer regions.deinit(init.gpa);
-
-                    for (regions.regions) |*region| {
-                        std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
-                    }
+                    mapped_regions = try procmaps.readExecutableRegions(init.io, init.gpa, pid);
                 }
-
 
                 // Before the process closes epoll triggers all of the events 
                 // TODO: Find documentation for that
@@ -263,6 +258,12 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             }
+        }
+    }
+
+    if (mapped_regions) |regions| {
+        for (regions.regions) |*region| {
+            std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
         }
     }
 
@@ -276,15 +277,20 @@ pub fn main(init: std.process.Init) !void {
 
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
-        try writer.print("{},{},{},", .{ sample.cpu, sample.tid, sample.time_ns });
+        try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
         for (0 .. sample.cc_len) |i| {
-            if (i + 1 == sample.cc_len) {
-                try writer.print("{x}\n", .{ samples.ips.items[ip_ix] });
-            } else {
-                try writer.print("{x}>", .{ samples.ips.items[ip_ix] });
-            }
+            const ip = samples.ips.items[ip_ix];
+            if (mapped_regions) |regions| {
+                if (regions.lookupAddress(ip)) |region| {
+                    const offset = region.offset + ip - region.start;
+                    try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
+                } else {
+                    try writer.print("  {}: {x}\n", .{ i, ip });
+                }
+            } 
             ip_ix += 1;
         }
+        try writer.print("\n", .{});
     }
 
 

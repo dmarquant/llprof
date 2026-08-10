@@ -11,7 +11,7 @@ const MmapRegion = struct {
     }
 };
 
-const MappedRegions = struct {
+pub const MappedRegions = struct {
     regions: []MmapRegion,
 
     pub fn deinit(self: *MappedRegions, gpa: std.mem.Allocator) void {
