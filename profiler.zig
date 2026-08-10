@@ -21,6 +21,37 @@ const Samples = struct {
     }
 };
 
+const ExecutableRegion = struct {
+    // mapped address space
+    start: u64,
+    end: u64,
+
+    file_name: []const u8,
+    offset: u64,
+
+    elf_file: ?std.Io.File = null,
+    elf: ?std.debug.ElfFile = null,
+    dwarf: ?std.debug.Dwarf = null,
+
+    fn deinit(region: *ExecutableRegion, io: std.Io, gpa: std.mem.Allocator) void {
+        if (region.dwarf) |*dwarf| {
+            dwarf.deinit(gpa);
+        }
+        if (region.elf_file) |f| {
+            f.close(io);
+        }
+    }
+};
+
+fn lookupAddress(regions: []ExecutableRegion, addr: u64) ?ExecutableRegion {
+    for (regions) |region| {
+        if (region.start <= addr and addr < region.end) {
+            return region;
+        }
+    }
+    return null;
+}
+
 // Basically a perf_event sampling data for a single cpu
 const PerfSampler = struct {
     cpu: u64,
@@ -261,9 +292,40 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (mapped_regions) |regions| {
-        for (regions.regions) |*region| {
-            std.debug.print("0x{x}-0x{x} mapped from {s}@{x}\n", .{ region.start, region.end, region.file_name, region.offset });
+    var regions: std.ArrayList(ExecutableRegion) = .empty;
+    defer regions.deinit(init.gpa);
+    defer for (regions.items) |*region| region.deinit(init.io, init.gpa);
+
+    if (mapped_regions) |mapped| {
+        for (mapped.regions) |region| {
+            std.debug.print("Loading elf: {s}\n", .{ region.file_name });
+            var executable_region = ExecutableRegion{
+                .start = region.start,
+                .end = region.end,
+                .file_name = region.file_name,
+                .offset = region.offset,
+            };
+            if (region.file_name[0] == '/') {
+                if (std.Io.Dir.openFileAbsolute(init.io, region.file_name, .{})) |elf_file| {
+                    executable_region.elf_file = elf_file;
+
+                    // TODO: Figure out what is actually needed 
+                    // TODO: What is the nullable build id parameter?
+                    const search_paths = std.debug.ElfFile.DebugInfoSearchPaths.none;
+                    const elf = try std.debug.ElfFile.load(init.gpa, init.io, elf_file, null, &search_paths);
+
+                    executable_region.elf = elf;
+                    executable_region.dwarf = elf.dwarf;
+                    if (executable_region.dwarf) |*dwarf| {
+                        try dwarf.open(init.gpa, .native);
+                        std.debug.print("Got dwarf file for: {s}\n", .{ region.file_name });
+                    }
+                } else |_| {
+                    std.debug.print("Failed to load elf file: {s}\n", .{ region.file_name });
+                }
+            }
+            try regions.append(init.gpa, executable_region);
+
         }
     }
 
@@ -280,14 +342,23 @@ pub fn main(init: std.process.Init) !void {
         try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
         for (0 .. sample.cc_len) |i| {
             const ip = samples.ips.items[ip_ix];
-            if (mapped_regions) |regions| {
-                if (regions.lookupAddress(ip)) |region| {
-                    const offset = region.offset + ip - region.start;
-                    try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
-                } else {
-                    try writer.print("  {}: {x}\n", .{ i, ip });
+            if (lookupAddress(regions.items, ip)) |region| {
+                const offset = region.offset + ip - region.start;
+                const symbol_name = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
+
+                if (region.dwarf) |_| {
+                    const sym = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
+                    std.debug.print("Symbol name: {?s}\n", .{ sym });
                 }
-            } 
+
+                if (symbol_name) |name| {
+                    try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, name });
+                } else {
+                    try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
+                }
+            } else {
+                try writer.print("  {}: {x}\n", .{ i, ip });
+            }
             ip_ix += 1;
         }
         try writer.print("\n", .{});
