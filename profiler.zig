@@ -346,11 +346,6 @@ pub fn main(init: std.process.Init) !void {
                 const offset = region.offset + ip - region.start;
                 const symbol_name = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
 
-                if (region.dwarf) |_| {
-                    const sym = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
-                    std.debug.print("Symbol name: {?s}\n", .{ sym });
-                }
-
                 if (symbol_name) |name| {
                     try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, name });
                 } else {
