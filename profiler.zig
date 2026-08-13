@@ -123,6 +123,8 @@ fn recordSamples(sampler: PerfSampler, samples: *Samples, gpa: std.mem.Allocator
         const header = try reader.takeStruct(linux.perf_event_header);
 
         const ip = try reader.takeInt(u64);
+        _ = ip;
+
         const pid = try reader.takeInt(u32);
         const tid = try reader.takeInt(u32);
         const time = try reader.takeInt(u64);
@@ -132,7 +134,7 @@ fn recordSamples(sampler: PerfSampler, samples: *Samples, gpa: std.mem.Allocator
             .cpu = @intCast(sampler.cpu),
             .tid = tid,
             .time_ns = time,
-            .cc_len = @intCast(size_callchain + 1), // one more for the current ip
+            .cc_len = @intCast(size_callchain),
         };
 
         try samples.samples.append(gpa, sample);
@@ -149,8 +151,6 @@ fn recordSamples(sampler: PerfSampler, samples: *Samples, gpa: std.mem.Allocator
             const cc_ip = try reader.takeInt(u64);
             try samples.ips.append(gpa, cc_ip);
         }
-
-        try samples.ips.append(gpa, ip);
 
         _ = pid;
 
@@ -345,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
             if (lookupAddress(regions.items, ip)) |region| {
                 const offset = region.offset + ip - region.start;
                 const symbol_name = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
+
 
                 if (symbol_name) |name| {
                     try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, name });
