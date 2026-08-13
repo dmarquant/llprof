@@ -52,6 +52,38 @@ fn lookupAddress(regions: []ExecutableRegion, addr: u64) ?ExecutableRegion {
     return null;
 }
 
+fn lookupInlinedFunction(gpa: std.mem.Allocator, address: u64, di: *const std.debug.Dwarf) ![][]const u8 {
+    var functions: std.ArrayList([]const u8) = .empty;
+
+    var found_subprogram = false;
+    var i: usize = 0; 
+    while (i < di.func_list.items.len) {
+        const func = &di.func_list.items[i];
+        if (func.pc_range) |range| {
+            if (!found_subprogram) {
+                if (address >= range.start and address < range.end) {
+                    found_subprogram = true;
+                    if (func.name) |fname| {
+                        // TODO: Add else branch
+                        try functions.append(gpa, fname);
+                    }
+                }
+            } else {
+                if (range.start > address) {
+                    break;
+                } else if (address >= range.start and address < range.end) {
+                    if (func.name) |fname| {
+                        // TODO: Add else branch
+                        try functions.append(gpa, fname);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return try functions.toOwnedSlice(gpa);
+}
+
 // Basically a perf_event sampling data for a single cpu
 const PerfSampler = struct {
     cpu: u64,
@@ -147,7 +179,8 @@ fn recordSamples(sampler: PerfSampler, samples: *Samples, gpa: std.mem.Allocator
         // previous sample. And for the callchain I could store the number of samples that are
         // equal. Maybe separate arrays would also make sense.
         for (0 .. size_callchain) |_| {
-            // TODO: Kernel/userspace transitions
+            // TODO: Kernel/userspace transitions. There will be special markers in the callchain to
+            // identify transitions
             const cc_ip = try reader.takeInt(u64);
             try samples.ips.append(gpa, cc_ip);
         }
@@ -276,8 +309,7 @@ pub fn main(init: std.process.Init) !void {
                 break :outer;
             } else {
                 if (mapped_regions == null) {
-                    // TODO: Remove this debug output
-                    // TODO: Attach region information to the samples
+                    // TODO: Check if this is needed again in case a library is added dynamically
                     mapped_regions = try procmaps.readExecutableRegions(init.io, init.gpa, pid);
                 }
 
@@ -315,6 +347,8 @@ pub fn main(init: std.process.Init) !void {
                     const elf = try std.debug.ElfFile.load(init.gpa, init.io, elf_file, null, &search_paths);
 
                     executable_region.elf = elf;
+
+                    // TODO: use stripped debug symbols of system dlls (maybe correctly setting search paths is enough)
                     executable_region.dwarf = elf.dwarf;
                     if (executable_region.dwarf) |*dwarf| {
                         try dwarf.open(init.gpa, .native);
@@ -340,15 +374,23 @@ pub fn main(init: std.process.Init) !void {
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
         try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
+
         for (0 .. sample.cc_len) |i| {
             const ip = samples.ips.items[ip_ix];
             if (lookupAddress(regions.items, ip)) |region| {
                 const offset = region.offset + ip - region.start;
-                const symbol_name = if (region.dwarf) |dwarf| dwarf.getSymbolName(offset) else null;
 
+                if (region.dwarf) |dwarf| {
+                    const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
+                    defer init.gpa.free(functions);
 
-                if (symbol_name) |name| {
-                    try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, name });
+                    var fi: usize = functions.len;
+                    while (fi > 0) {
+                        fi -= 1;
+                        const f = functions[fi];
+                        try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
+                    }
+
                 } else {
                     try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
                 }
