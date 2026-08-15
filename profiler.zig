@@ -243,8 +243,11 @@ pub fn main(init: std.process.Init) !void {
             .inherit = true,
             .exclude_kernel = true,
             .exclude_hv = true,
+            .exclude_user = false,
+            .exclude_callchain_user = false,
+            .sample_id_all = true,
             .freq = true,
-            .precise_ip = 0, // TODO: Is 2 ok? :)
+            .precise_ip = 3, // TODO: Is 2 ok? :)
             .enable_on_exec = true,
         }
     };
@@ -351,8 +354,12 @@ pub fn main(init: std.process.Init) !void {
                     // TODO: use stripped debug symbols of system dlls (maybe correctly setting search paths is enough)
                     executable_region.dwarf = elf.dwarf;
                     if (executable_region.dwarf) |*dwarf| {
-                        try dwarf.open(init.gpa, .native);
-                        std.debug.print("Got dwarf file for: {s}\n", .{ region.file_name });
+                        if (dwarf.open(init.gpa, .native)) {
+                            std.debug.print("Got dwarf file for: {s}\n", .{ region.file_name });
+                        } else |_| {
+                            std.debug.print("Failed to read dwarf file for: {s}\n", .{ region.file_name });
+                            executable_region.dwarf = null;
+                        }
                     }
                 } else |_| {
                     std.debug.print("Failed to load elf file: {s}\n", .{ region.file_name });
@@ -383,6 +390,9 @@ pub fn main(init: std.process.Init) !void {
                 if (region.dwarf) |dwarf| {
                     const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
                     defer init.gpa.free(functions);
+                    if (functions.len < 1) {
+                        try writer.print("  {}: {s}@{x} (dwarf lookup failed)\n", .{ i, region.file_name, offset });
+                    }
 
                     var fi: usize = functions.len;
                     while (fi > 0) {
