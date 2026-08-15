@@ -2,6 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const ArrayList = std.ArrayList;
 
+const serialization = @import("serialization.zig");
 const procmaps = @import("procmaps.zig");
 
 const Sample = struct {
@@ -19,6 +20,12 @@ const Samples = struct {
         samples.samples.deinit(gpa);
         samples.ips.deinit(gpa);
     }
+};
+
+const SampleBinHeader = extern struct {
+    major_version: u32,
+    minor_version: u32,
+    string_table_offset: u64
 };
 
 const ExecutableRegion = struct {
@@ -373,10 +380,25 @@ pub fn main(init: std.process.Init) !void {
     var cwd = std.Io.Dir.cwd();
     var outFile = try cwd.createFile(init.io, "./samples.txt", .{});
 
-    
     var outbuffer: [4096 * 4]u8 = undefined;
     var fwriter = outFile.writer(init.io, &outbuffer);
     var writer = &fwriter.interface;
+
+    var bin_file = try cwd.createFile(init.io, "./samples.bin", .{});
+    var binary_buffer: [4096 * 8]u8 = undefined;
+    var bin_writer = bin_file.writer(init.io, &binary_buffer);
+    var bwriter = &bin_writer.interface;
+
+    var header: SampleBinHeader = .{
+        .major_version = 0,
+        .minor_version = 1,
+        .string_table_offset = 0,
+    };
+
+    var sample_writer: serialization.SampleWriter = .{};
+    defer sample_writer.deinit(init.gpa);
+
+    try bwriter.writeStruct(header, .little);
 
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
@@ -391,7 +413,21 @@ pub fn main(init: std.process.Init) !void {
                     const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
                     defer init.gpa.free(functions);
                     if (functions.len < 1) {
+                        _ = try sample_writer.addOrGet(init.gpa, region.file_name);
                         try writer.print("  {}: {s}@{x} (dwarf lookup failed)\n", .{ i, region.file_name, offset });
+
+                        const s = serialization.SampleData{
+                            .top = i == 0,
+                            .known_file = true,
+                            .known_symbol = false,
+                            .was_inlined = false,
+                            .cpu = sample.cpu,
+                            .tid = sample.tid,
+                            .time_ns = sample.time_ns,
+                            .offset = offset,
+                            .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
+                        };
+                        try sample_writer.writeSample(bwriter, s);
                     }
 
                     var fi: usize = functions.len;
@@ -399,19 +435,67 @@ pub fn main(init: std.process.Init) !void {
                         fi -= 1;
                         const f = functions[fi];
                         try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
+
+                        const s = serialization.SampleData{
+                            .top = i == 0,
+                            .known_file = true,
+                            .known_symbol = true,
+                            .was_inlined = fi == 0,
+                            .cpu = sample.cpu,
+                            .tid = sample.tid,
+                            .time_ns = sample.time_ns,
+                            .offset = offset,
+                            .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
+                            .symbol_name = try sample_writer.addOrGet(init.gpa, f),
+                        };
+
+                        try sample_writer.writeSample(bwriter, s);
                     }
 
                 } else {
                     try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
+                    const s = serialization.SampleData{
+                        .top = i == 0,
+                        .known_file = true,
+                        .known_symbol = false,
+                        .was_inlined = false,
+                        .cpu = sample.cpu,
+                        .tid = sample.tid,
+                        .time_ns = sample.time_ns,
+                        .offset = offset,
+                        .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
+                    };
+                    try sample_writer.writeSample(bwriter, s);
                 }
             } else {
                 try writer.print("  {}: {x}\n", .{ i, ip });
+                const s = serialization.SampleData{
+                    .top = i == 0,
+                    .known_file = false,
+                    .known_symbol = false,
+                    .was_inlined = false,
+                    .cpu = sample.cpu,
+                    .tid = sample.tid,
+                    .time_ns = sample.time_ns,
+                    .offset = ip,
+                };
+                try sample_writer.writeSample(bwriter, s);
             }
             ip_ix += 1;
         }
         try writer.print("\n", .{});
     }
 
+    header.string_table_offset = bin_writer.logicalPos();
+    try bwriter.writeAll(sample_writer.string_table.items);
+
+    try bin_writer.seekTo(0);
+    try bwriter.writeStruct(header, .little);
+
+    std.debug.print("String table size: {}\n", .{ sample_writer.string_table.items.len });
+
+    try bwriter.flush();
+    bin_file.close(init.io);
 
     const memory_usage = samples.samples.items.len * @sizeOf(Sample) + samples.ips.items.len * 8;
     std.debug.print("Storing {} samples takes {} bytes\n", .{ samples.samples.items.len, memory_usage });
