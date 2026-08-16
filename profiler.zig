@@ -434,21 +434,8 @@ pub fn main(init: std.process.Init) !void {
     var fwriter = outFile.writer(init.io, &outbuffer);
     var writer = &fwriter.interface;
 
-    var bin_file = try cwd.createFile(init.io, "./samples.bin", .{});
-    var binary_buffer: [4096 * 8]u8 = undefined;
-    var bin_writer = bin_file.writer(init.io, &binary_buffer);
-    var bwriter = &bin_writer.interface;
-
-    var header: SampleBinHeader = .{
-        .major_version = 0,
-        .minor_version = 1,
-        .string_table_offset = 0,
-    };
-
-    var sample_writer: serialization.SampleWriter = .{};
-    defer sample_writer.deinit(init.gpa);
-
-    try bwriter.writeStruct(header, .little);
+    var string_table: serialization.StringTable = .{};
+    defer string_table.deinit(init.gpa);
 
     // ip -> location
     // TODO: use arena
@@ -461,6 +448,14 @@ pub fn main(init: std.process.Init) !void {
     const inline_allocator = inline_arena.allocator();
 
     var locs: locations.FillingLocationTable = .{};
+
+    // Almost the same as the raw samples, but the callchain length can differ due to inlined functions
+    // TODO: Can I change the raw samples ininline instead?
+    var sample_list: std.ArrayList(serialization.SampleData) = .empty;
+    defer sample_list.deinit(init.gpa);
+
+    var location_list: std.ArrayList(u32) = .empty;
+    defer location_list.deinit(init.gpa);
 
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
@@ -486,7 +481,7 @@ pub fn main(init: std.process.Init) !void {
                         defer init.gpa.free(functions);
 
                         if (functions.len == 0) {
-                            const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                            const elf_file = try string_table.addOrGet(init.gpa, region.file_name);
                             lc_entry.value_ptr.* = .{
                                 .elf_file = .{
                                     .name = elf_file,
@@ -496,8 +491,8 @@ pub fn main(init: std.process.Init) !void {
                         } else {
                             var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
                             for (functions, 0..) |f, fi| {
-                                const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                                const symbol_name = try sample_writer.addOrGet(init.gpa, f);
+                                const elf_file = try string_table.addOrGet(init.gpa, region.file_name);
+                                const symbol_name = try string_table.addOrGet(init.gpa, f);
                                 inlined_cc[fi] = .{
                                     .file_name = elf_file,
                                     .name = symbol_name
@@ -506,7 +501,7 @@ pub fn main(init: std.process.Init) !void {
                             lc_entry.value_ptr.* = .{ .inlined_symbol = inlined_cc };
                         }
                     } else {
-                        const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                        const elf_file = try string_table.addOrGet(init.gpa, region.file_name);
                         lc_entry.value_ptr.* = .{ 
                             .elf_file = .{
                                 .name = elf_file,
@@ -522,32 +517,36 @@ pub fn main(init: std.process.Init) !void {
             switch (lc_entry.value_ptr.*) {
                 .address => {
                     try writer.print("  {}: {x}\n", .{ cc_i, ip });
-                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    const loc_ix = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    try location_list.append(init.gpa, loc_ix);
 
                     cc_i += 1;
                 },
                 .elf_file => |file| {
-                    const name = sample_writer.get(file.name);
+                    const name = string_table.get(file.name);
                     try writer.print("  {}: {s}@{x}\n", .{ cc_i, name, file.offset });
-                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    const loc_ix = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    try location_list.append(init.gpa, loc_ix);
 
                     cc_i += 1;
                 },
                 .symbol => |symbol| {
-                    const file_name = sample_writer.get(symbol.file_name);
-                    const symbol_name = sample_writer.get(symbol.name);
+                    const file_name = string_table.get(symbol.file_name);
+                    const symbol_name = string_table.get(symbol.name);
                     try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
-                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    const loc_ix = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+                    try location_list.append(init.gpa, loc_ix);
 
                     cc_i += 1;
                 },
                 .inlined_symbol => |symbols| {
                     for (symbols) |symbol| {
-                        const file_name = sample_writer.get(symbol.file_name);
-                        const symbol_name = sample_writer.get(symbol.name);
+                        const file_name = string_table.get(symbol.file_name);
+                        const symbol_name = string_table.get(symbol.name);
                         try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
 
-                        _ = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
+                        const loc_ix = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
+                        try location_list.append(init.gpa, loc_ix);
 
                         cc_i += 1;
                     }
@@ -556,27 +555,27 @@ pub fn main(init: std.process.Init) !void {
             ip_ix += 1;
         }
         try writer.print("\n", .{});
+
+        try sample_list.append(init.gpa, .{
+            .time_ns = sample.time_ns,
+            .cpu = sample.cpu,
+            .tid = sample.tid,
+            .num_frames = @intCast(cc_i)
+        });
     }
 
     var it = locs.hash_map.iterator();
     while (it.next()) |loc| {
         std.debug.print("Unique location: {} -> {}\n", .{ loc.key_ptr, loc.value_ptr.* });
     }
-    
 
-    header.string_table_offset = bin_writer.logicalPos();
-    try bwriter.writeAll(sample_writer.string_table.items);
+    std.debug.print("Storing {} samples and {} locations \n", .{ sample_list.items.len, location_list.items.len });
 
-    try bin_writer.seekTo(0);
-    try bwriter.writeStruct(header, .little);
-
-    std.debug.print("String table size: {}\n", .{ sample_writer.string_table.items.len });
-
-    try bwriter.flush();
-    bin_file.close(init.io);
-
-    const memory_usage = samples.samples.items.len * @sizeOf(Sample) + samples.ips.items.len * 8;
-    std.debug.print("Storing {} samples takes {} bytes\n", .{ samples.samples.items.len, memory_usage });
+    var samples_bin_file = try cwd.createFile(init.io, "./samples.bin", .{});
+    var samples_out_buffer: [4096 * 16]u8 = undefined;
+    var samples_writer = samples_bin_file.writer(init.io, &samples_out_buffer);
+    const bin_writer = &samples_writer.interface;
+    try serialization.writeSamples(bin_writer, string_table, locs, sample_list.items, location_list.items);
 
     // TODO: Configure watermark to get woken up? Seems to do it automatically
     try writer.flush();

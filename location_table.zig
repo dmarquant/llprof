@@ -9,7 +9,7 @@ const serialization = @import("serialization.zig");
 /// there is a location table for filling with fast insertion and then there is a filled one for
 /// fast lookup.
 ///
-pub const LocationType = enum {
+pub const LocationType = enum (u8) {
     address,
     elf_file,
     symbol,
@@ -41,5 +41,20 @@ pub const FillingLocationTable = struct {
             table.next += 1;
         }
         return it.value_ptr.*;
+    }
+
+    pub fn serializedSize(table: *const FillingLocationTable) u32 {
+        var byteSize: usize = 0;
+
+        var it = table.hash_map.keyIterator();
+        while (it.next()) |loc| {
+            byteSize += 1;
+            byteSize += switch (loc.*) {
+                .address => 8,
+                .elf_file => 16,
+                .symbol => 16,
+            };
+        }
+        return @intCast(byteSize);
     }
 };
