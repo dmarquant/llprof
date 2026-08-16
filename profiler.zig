@@ -495,21 +495,14 @@ pub fn main(init: std.process.Init) !void {
                             };
                         } else {
                             var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
-
-                            // TODO: Is this neccessary to do inverted? On the reader site it is inverted again...
-                            var fi: usize = functions.len;
-                            while (fi > 0) {
-                                fi -= 1;
-                                const f = functions[fi];
+                            for (functions, 0..) |f, fi| {
                                 const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
                                 const symbol_name = try sample_writer.addOrGet(init.gpa, f);
-
                                 inlined_cc[fi] = .{
                                     .file_name = elf_file,
                                     .name = symbol_name
                                 };
                             }
-
                             lc_entry.value_ptr.* = .{ .inlined_symbol = inlined_cc };
                         }
                     } else {
@@ -549,10 +542,7 @@ pub fn main(init: std.process.Init) !void {
                     cc_i += 1;
                 },
                 .inlined_symbol => |symbols| {
-                    var fi: usize = symbols.len;
-                    while (fi > 0) {
-                        fi -= 1;
-                        const symbol = symbols[fi];
+                    for (symbols) |symbol| {
                         const file_name = sample_writer.get(symbol.file_name);
                         const symbol_name = sample_writer.get(symbol.name);
                         try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
