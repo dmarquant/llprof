@@ -110,6 +110,7 @@ fn lookupAddress(regions: []ExecutableRegion, addr: u64) ?ExecutableRegion {
 }
 
 fn lookupInlinedFunction(gpa: std.mem.Allocator, address: u64, di: *const std.debug.Dwarf) ![][]const u8 {
+    std.debug.print("Looking up functions: 0x{x}\n", .{ address });
     var functions: std.ArrayList([]const u8) = .empty;
 
     var found_subprogram = false;
@@ -122,6 +123,7 @@ fn lookupInlinedFunction(gpa: std.mem.Allocator, address: u64, di: *const std.de
                     found_subprogram = true;
                     if (func.name) |fname| {
                         // TODO: Add else branch
+                        std.debug.print("  {s}\n", .{ fname });
                         try functions.append(gpa, fname);
                     }
                 }
@@ -131,6 +133,8 @@ fn lookupInlinedFunction(gpa: std.mem.Allocator, address: u64, di: *const std.de
                 } else if (address >= range.start and address < range.end) {
                     if (func.name) |fname| {
                         // TODO: Add else branch
+                        //
+                        std.debug.print("  {s}\n", .{ fname });
                         try functions.append(gpa, fname);
                     }
                 }
@@ -489,17 +493,15 @@ pub fn main(init: std.process.Init) !void {
                                 }
                             };
                         } else {
-                            // TODO: Check again the inline resolution. It doesn't seem to work correctly.
+                            // TODO: Only use 'inlined' if there is more than one function
                             var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
 
-                            var fi: usize = functions.len;
-                            while (fi > 0) {
-                                fi -= 1;
 
-                                const f = functions[fi];
+                            for (functions, 0..) |f, fi| {
+                                std.debug.print("inlined {}: {s}\n", .{ fi, f });
                                 const elf_file = try string_table.addOrGet(init.gpa, region.file_name);
                                 const symbol_name = try string_table.addOrGet(init.gpa, f);
-                                inlined_cc[fi] = .{
+                                inlined_cc[functions.len - fi - 1] = .{
                                     .file_name = elf_file,
                                     .name = symbol_name
                                 };
@@ -568,11 +570,6 @@ pub fn main(init: std.process.Init) !void {
             .tid = sample.tid,
             .num_frames = @intCast(cc_i)
         });
-    }
-
-    var it = locs.hash_map.iterator();
-    while (it.next()) |loc| {
-        std.debug.print("Unique location: {} -> {}\n", .{ loc.key_ptr, loc.value_ptr.* });
     }
 
     std.debug.print("Storing {} samples and {} locations \n", .{ sample_list.items.len, location_list.items.len });
