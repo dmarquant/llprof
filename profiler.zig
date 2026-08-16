@@ -254,7 +254,7 @@ pub fn main(init: std.process.Init) !void {
             .exclude_callchain_user = false,
             .sample_id_all = true,
             .freq = true,
-            .precise_ip = 3, // TODO: Is 2 ok? :)
+            .precise_ip = 0, // TODO: Is 2 ok? :)
             .enable_on_exec = true,
         }
     };
@@ -404,6 +404,8 @@ pub fn main(init: std.process.Init) !void {
     for (samples.samples.items) |sample| {
         try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
 
+        var top: bool = true;
+
         for (0 .. sample.cc_len) |i| {
             const ip = samples.ips.items[ip_ix];
             if (lookupAddress(regions.items, ip)) |region| {
@@ -417,7 +419,7 @@ pub fn main(init: std.process.Init) !void {
                         try writer.print("  {}: {s}@{x} (dwarf lookup failed)\n", .{ i, region.file_name, offset });
 
                         const s = serialization.SampleData{
-                            .top = i == 0,
+                            .top = top,
                             .known_file = true,
                             .known_symbol = false,
                             .was_inlined = false,
@@ -428,6 +430,7 @@ pub fn main(init: std.process.Init) !void {
                             .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
                         };
                         try sample_writer.writeSample(bwriter, s);
+                        top = false;
                     }
 
                     var fi: usize = functions.len;
@@ -437,7 +440,7 @@ pub fn main(init: std.process.Init) !void {
                         try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
 
                         const s = serialization.SampleData{
-                            .top = i == 0,
+                            .top = top,
                             .known_file = true,
                             .known_symbol = true,
                             .was_inlined = fi == 0,
@@ -448,14 +451,14 @@ pub fn main(init: std.process.Init) !void {
                             .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
                             .symbol_name = try sample_writer.addOrGet(init.gpa, f),
                         };
-
                         try sample_writer.writeSample(bwriter, s);
+                        top = false;
                     }
 
                 } else {
                     try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
                     const s = serialization.SampleData{
-                        .top = i == 0,
+                        .top = top,
                         .known_file = true,
                         .known_symbol = false,
                         .was_inlined = false,
@@ -466,20 +469,24 @@ pub fn main(init: std.process.Init) !void {
                         .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
                     };
                     try sample_writer.writeSample(bwriter, s);
+                    top = false;
                 }
             } else {
-                try writer.print("  {}: {x}\n", .{ i, ip });
-                const s = serialization.SampleData{
-                    .top = i == 0,
-                    .known_file = false,
-                    .known_symbol = false,
-                    .was_inlined = false,
-                    .cpu = sample.cpu,
-                    .tid = sample.tid,
-                    .time_ns = sample.time_ns,
-                    .offset = ip,
-                };
-                try sample_writer.writeSample(bwriter, s);
+                if (ip != 0xfffffffffffffe00) {
+                    try writer.print("  {}: {x}\n", .{ i, ip });
+                    const s = serialization.SampleData{
+                        .top = top,
+                        .known_file = false,
+                        .known_symbol = false,
+                        .was_inlined = false,
+                        .cpu = sample.cpu,
+                        .tid = sample.tid,
+                        .time_ns = sample.time_ns,
+                        .offset = ip,
+                    };
+                    try sample_writer.writeSample(bwriter, s);
+                    top = false;
+                }
             }
             ip_ix += 1;
         }
