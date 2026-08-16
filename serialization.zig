@@ -41,7 +41,7 @@ pub const SampleData = struct {
 pub fn writeSamples(writer: *std.Io.Writer, st: StringTable, lt: LocationTable, samples: []SampleData, callchains: []u32) !void {
     const header: ProfilingDataHeader = .{
         .string_table_bytes = @intCast(st.table.items.len),
-        .location_table_length = lt.serializedSize(),
+        .location_table_length = lt.hash_map.count(),
         .num_samples = samples.len,
         .num_locations = callchains.len,
     };

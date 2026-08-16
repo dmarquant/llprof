@@ -489,8 +489,14 @@ pub fn main(init: std.process.Init) !void {
                                 }
                             };
                         } else {
+                            // TODO: Check again the inline resolution. It doesn't seem to work correctly.
                             var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
-                            for (functions, 0..) |f, fi| {
+
+                            var fi: usize = functions.len;
+                            while (fi > 0) {
+                                fi -= 1;
+
+                                const f = functions[fi];
                                 const elf_file = try string_table.addOrGet(init.gpa, region.file_name);
                                 const symbol_name = try string_table.addOrGet(init.gpa, f);
                                 inlined_cc[fi] = .{
@@ -543,7 +549,7 @@ pub fn main(init: std.process.Init) !void {
                     for (symbols) |symbol| {
                         const file_name = string_table.get(symbol.file_name);
                         const symbol_name = string_table.get(symbol.name);
-                        try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
+                        try writer.print("  {}: 0x{x} {s}:{s} (inlined)\n", .{ cc_i, ip, file_name, symbol_name });
 
                         const loc_ix = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
                         try location_list.append(init.gpa, loc_ix);

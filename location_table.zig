@@ -32,7 +32,7 @@ pub const Location = union(LocationType) {
 
 pub const FillingLocationTable = struct {
     hash_map: std.AutoHashMapUnmanaged(Location, u32) = .{},
-    next: u32 = 1,
+    next: u32 = 0,
 
     pub fn addOrGet(table: *FillingLocationTable, gpa: std.mem.Allocator, location: Location) !u32 {
         const it = try table.hash_map.getOrPut(gpa, location);
