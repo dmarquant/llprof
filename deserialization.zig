@@ -25,6 +25,12 @@ const SampleCount = struct {
     exclusive: u64,
 };
 
+const LocationSampled = struct {
+    location: Location,
+    inclusive: u64,
+    exclusive: u64,
+};
+
 pub fn readSamples(file_reader: *std.Io.File.Reader, gpa: std.mem.Allocator) !void {
     var reader = &file_reader.interface;
 

@@ -3,13 +3,13 @@
 #include <pthread.h>
 
 void super_slow_function(volatile uint64_t* count) {
-  for (uint64_t i = 0; i < 50000000; i++) {
+  for (uint64_t i = 0; i < 100000000; i++) {
     *count += i;
   }
 }
 
 void slow_function(volatile uint64_t* count) {
-  for (uint64_t i = 0; i < 5000000; i++) {
+  for (uint64_t i = 0; i < 10000000; i++) {
     *count += i;
   }
 }

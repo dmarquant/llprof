@@ -22,6 +22,37 @@ const Samples = struct {
     }
 };
 
+
+const LocationType = enum {
+    // Only the address is known
+    address,
+
+    // The file containing the address at runtime + offset
+    elf_file,
+    
+    // A symbol name is known
+    symbol,
+
+    // A inlined symbol, stores a list of symbols
+    inlined_symbol,
+};
+
+const SymbolInfo = struct {
+    file_name: serialization.StringTableEntry,
+    name: serialization.StringTableEntry,
+    // TODO: Add line number info
+};
+
+const Location = union(LocationType) {
+    address: u64,
+    elf_file: struct {
+        name: serialization.StringTableEntry,
+        offset: u64,
+    },
+    symbol: SymbolInfo,
+    inlined_symbol: []SymbolInfo,
+};
+
 const SampleBinHeader = extern struct {
     major_version: u32,
     minor_version: u32,
@@ -400,6 +431,16 @@ pub fn main(init: std.process.Init) !void {
 
     try bwriter.writeStruct(header, .little);
 
+    // ip -> location
+    // TODO: use arena
+    var location_cache: std.AutoHashMapUnmanaged(u64, Location) = .{};
+    defer location_cache.clearAndFree(init.gpa);
+
+    var inline_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer inline_arena.deinit();
+
+    const inline_allocator = inline_arena.allocator();
+
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
         try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
@@ -408,14 +449,49 @@ pub fn main(init: std.process.Init) !void {
 
         for (0 .. sample.cc_len) |i| {
             const ip = samples.ips.items[ip_ix];
+
+            if (location_cache.getPtr(ip)) |location| {
+                switch (location.*) {
+                    .address => {
+                        try writer.print("  {}: {x}\n", .{ i, ip });
+                    },
+                    .elf_file => |file| {
+                        const name = sample_writer.get(file.name);
+                        try writer.print("  {}: {s}@{x}\n", .{ i, name, file.offset });
+                    },
+                    .symbol => |symbol| {
+                        const file_name = sample_writer.get(symbol.file_name);
+                        const symbol_name = sample_writer.get(symbol.name);
+                        try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
+                    },
+                    .inlined_symbol => |symbols| {
+                        var fi: usize = symbols.len;
+                        while (fi > 0) {
+                            fi -= 1;
+                            const symbol = symbols[fi];
+                            const file_name = sample_writer.get(symbol.file_name);
+                            const symbol_name = sample_writer.get(symbol.name);
+                            try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
+                        }
+                    }
+                }
+                ip_ix += 1;
+                continue;
+            }
+
             if (lookupAddress(regions.items, ip)) |region| {
                 const offset = region.offset + ip - region.start;
 
                 if (region.dwarf) |dwarf| {
                     const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
                     defer init.gpa.free(functions);
-                    if (functions.len < 1) {
-                        _ = try sample_writer.addOrGet(init.gpa, region.file_name);
+                    if (functions.len == 0) {
+                        const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                        try location_cache.put(init.gpa, ip, Location{ .elf_file = .{
+                            .name = elf_file,
+                            .offset = offset
+                        }});
+
                         try writer.print("  {}: {s}@{x} (dwarf lookup failed)\n", .{ i, region.file_name, offset });
 
                         const s = serialization.SampleData{
@@ -427,35 +503,58 @@ pub fn main(init: std.process.Init) !void {
                             .tid = sample.tid,
                             .time_ns = sample.time_ns,
                             .offset = offset,
-                            .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
+                            .elf_file = elf_file,
                         };
                         try sample_writer.writeSample(bwriter, s);
                         top = false;
+                    } else {
+                        var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
+
+
+                        var fi: usize = functions.len;
+                        while (fi > 0) {
+                            fi -= 1;
+
+                            const f = functions[fi];
+                            const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                            const symbol_name = try sample_writer.addOrGet(init.gpa, f);
+
+                            inlined_cc[fi] = .{
+                                .file_name = elf_file,
+                                .name = symbol_name
+                            };
+
+                            if (fi == 0) {
+                                try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
+                            } else {
+                                try writer.print("  {}: {s}:{s} (inlined)\n", .{ i, region.file_name, f });
+                            }
+
+                            const s = serialization.SampleData{
+                                .top = top,
+                                .known_file = true,
+                                .known_symbol = true,
+                                .was_inlined = fi == 0,
+                                .cpu = sample.cpu,
+                                .tid = sample.tid,
+                                .time_ns = sample.time_ns,
+                                .offset = offset,
+                                .elf_file = elf_file,
+                                .symbol_name = symbol_name,
+                            };
+                            try sample_writer.writeSample(bwriter, s);
+                            top = false;
+                        }
+
+                        try location_cache.put(init.gpa, ip, Location{ .inlined_symbol = inlined_cc });
                     }
-
-                    var fi: usize = functions.len;
-                    while (fi > 0) {
-                        fi -= 1;
-                        const f = functions[fi];
-                        try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
-
-                        const s = serialization.SampleData{
-                            .top = top,
-                            .known_file = true,
-                            .known_symbol = true,
-                            .was_inlined = fi == 0,
-                            .cpu = sample.cpu,
-                            .tid = sample.tid,
-                            .time_ns = sample.time_ns,
-                            .offset = offset,
-                            .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
-                            .symbol_name = try sample_writer.addOrGet(init.gpa, f),
-                        };
-                        try sample_writer.writeSample(bwriter, s);
-                        top = false;
-                    }
-
                 } else {
+                    const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                    try location_cache.put(init.gpa, ip, Location{ .elf_file = .{
+                        .name = elf_file,
+                        .offset = offset
+                    }});
+
                     try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
                     const s = serialization.SampleData{
                         .top = top,
@@ -466,13 +565,16 @@ pub fn main(init: std.process.Init) !void {
                         .tid = sample.tid,
                         .time_ns = sample.time_ns,
                         .offset = offset,
-                        .elf_file = try sample_writer.addOrGet(init.gpa, region.file_name),
+                        .elf_file = elf_file,
                     };
                     try sample_writer.writeSample(bwriter, s);
                     top = false;
                 }
             } else {
+                // TODO: Get documentation on how exactly this first frame should be handled
                 if (ip != 0xfffffffffffffe00) {
+                    try location_cache.put(init.gpa, ip, Location{ .address = ip });
+
                     try writer.print("  {}: {x}\n", .{ i, ip });
                     const s = serialization.SampleData{
                         .top = top,
@@ -491,6 +593,11 @@ pub fn main(init: std.process.Init) !void {
             ip_ix += 1;
         }
         try writer.print("\n", .{});
+    }
+
+    var location_cache_it = location_cache.valueIterator();
+    while (location_cache_it.next()) |location| {
+        std.debug.print("Location: {}\n", .{ location });
     }
 
     header.string_table_offset = bin_writer.logicalPos();
