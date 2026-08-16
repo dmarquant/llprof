@@ -5,6 +5,10 @@ const ArrayList = std.ArrayList;
 const serialization = @import("serialization.zig");
 const procmaps = @import("procmaps.zig");
 
+const SymbolInfo = @import("location_table.zig").SymbolInfo;
+const Location = @import("location_table.zig").Location;
+const locations = @import("location_table.zig");
+
 const Sample = struct {
     cpu: u32,
     tid: u32,
@@ -23,7 +27,7 @@ const Samples = struct {
 };
 
 
-const LocationType = enum {
+const CachedLocationType = enum {
     // Only the address is known
     address,
 
@@ -37,13 +41,7 @@ const LocationType = enum {
     inlined_symbol,
 };
 
-const SymbolInfo = struct {
-    file_name: serialization.StringTableEntry,
-    name: serialization.StringTableEntry,
-    // TODO: Add line number info
-};
-
-const Location = union(LocationType) {
+const CachedLocation = union(CachedLocationType) {
     address: u64,
     elf_file: struct {
         name: serialization.StringTableEntry,
@@ -51,6 +49,27 @@ const Location = union(LocationType) {
     },
     symbol: SymbolInfo,
     inlined_symbol: []SymbolInfo,
+
+    fn toLocation(cl: CachedLocation) Location {
+        switch (cl) {
+            .address => |address| {
+                return .{ .address = address };
+            },
+            .elf_file => |elf_file| {
+                return .{ .elf_file = .{
+                    .name = elf_file.name,
+                    .offset = elf_file.offset
+                }};
+            },
+            .symbol => |symbol| {
+                return .{ .symbol = symbol };
+            },
+            else => {
+                std.debug.assert(false);
+                return .{ .address = 0 };
+            }
+        }
+    }
 };
 
 const SampleBinHeader = extern struct {
@@ -433,13 +452,15 @@ pub fn main(init: std.process.Init) !void {
 
     // ip -> location
     // TODO: use arena
-    var location_cache: std.AutoHashMapUnmanaged(u64, Location) = .{};
+    var location_cache: std.AutoHashMapUnmanaged(u64, CachedLocation) = .{};
     defer location_cache.clearAndFree(init.gpa);
 
     var inline_arena = std.heap.ArenaAllocator.init(init.gpa);
     defer inline_arena.deinit();
 
     const inline_allocator = inline_arena.allocator();
+
+    var locs: locations.FillingLocationTable = .{};
 
     var ip_ix: usize = 0;
     for (samples.samples.items) |sample| {
@@ -454,15 +475,18 @@ pub fn main(init: std.process.Init) !void {
                 switch (location.*) {
                     .address => {
                         try writer.print("  {}: {x}\n", .{ i, ip });
+                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
                     },
                     .elf_file => |file| {
                         const name = sample_writer.get(file.name);
                         try writer.print("  {}: {s}@{x}\n", .{ i, name, file.offset });
+                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
                     },
                     .symbol => |symbol| {
                         const file_name = sample_writer.get(symbol.file_name);
                         const symbol_name = sample_writer.get(symbol.name);
                         try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
+                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
                     },
                     .inlined_symbol => |symbols| {
                         var fi: usize = symbols.len;
@@ -472,6 +496,8 @@ pub fn main(init: std.process.Init) !void {
                             const file_name = sample_writer.get(symbol.file_name);
                             const symbol_name = sample_writer.get(symbol.name);
                             try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
+
+                            _ = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
                         }
                     }
                 }
@@ -487,7 +513,7 @@ pub fn main(init: std.process.Init) !void {
                     defer init.gpa.free(functions);
                     if (functions.len == 0) {
                         const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                        try location_cache.put(init.gpa, ip, Location{ .elf_file = .{
+                        try location_cache.put(init.gpa, ip, .{ .elf_file = .{
                             .name = elf_file,
                             .offset = offset
                         }});
@@ -546,11 +572,11 @@ pub fn main(init: std.process.Init) !void {
                             top = false;
                         }
 
-                        try location_cache.put(init.gpa, ip, Location{ .inlined_symbol = inlined_cc });
+                        try location_cache.put(init.gpa, ip, .{ .inlined_symbol = inlined_cc });
                     }
                 } else {
                     const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                    try location_cache.put(init.gpa, ip, Location{ .elf_file = .{
+                    try location_cache.put(init.gpa, ip, .{ .elf_file = .{
                         .name = elf_file,
                         .offset = offset
                     }});
@@ -573,7 +599,7 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 // TODO: Get documentation on how exactly this first frame should be handled
                 if (ip != 0xfffffffffffffe00) {
-                    try location_cache.put(init.gpa, ip, Location{ .address = ip });
+                    try location_cache.put(init.gpa, ip, .{ .address = ip });
 
                     try writer.print("  {}: {x}\n", .{ i, ip });
                     const s = serialization.SampleData{
@@ -595,10 +621,11 @@ pub fn main(init: std.process.Init) !void {
         try writer.print("\n", .{});
     }
 
-    var location_cache_it = location_cache.valueIterator();
-    while (location_cache_it.next()) |location| {
-        std.debug.print("Location: {}\n", .{ location });
+    var it = locs.hash_map.keyIterator();
+    while (it.next()) |loc| {
+        std.debug.print("Unique location: {}\n", .{ loc });
     }
+    
 
     header.string_table_offset = bin_writer.logicalPos();
     try bwriter.writeAll(sample_writer.string_table.items);
