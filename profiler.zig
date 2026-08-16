@@ -466,154 +466,101 @@ pub fn main(init: std.process.Init) !void {
     for (samples.samples.items) |sample| {
         try writer.print("{},{},{}\n", .{ sample.cpu, sample.tid, sample.time_ns });
 
-        var top: bool = true;
-
-        for (0 .. sample.cc_len) |i| {
+        var cc_i: usize = 0;
+        for (0 .. sample.cc_len) |_| {
             const ip = samples.ips.items[ip_ix];
 
-            if (location_cache.getPtr(ip)) |location| {
-                switch (location.*) {
-                    .address => {
-                        try writer.print("  {}: {x}\n", .{ i, ip });
-                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
-                    },
-                    .elf_file => |file| {
-                        const name = sample_writer.get(file.name);
-                        try writer.print("  {}: {s}@{x}\n", .{ i, name, file.offset });
-                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
-                    },
-                    .symbol => |symbol| {
-                        const file_name = sample_writer.get(symbol.file_name);
-                        const symbol_name = sample_writer.get(symbol.name);
-                        try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
-                        _ = try locs.addOrGet(inline_allocator, location.toLocation());
-                    },
-                    .inlined_symbol => |symbols| {
-                        var fi: usize = symbols.len;
-                        while (fi > 0) {
-                            fi -= 1;
-                            const symbol = symbols[fi];
-                            const file_name = sample_writer.get(symbol.file_name);
-                            const symbol_name = sample_writer.get(symbol.name);
-                            try writer.print("  {}: 0x{x} {s}:{s}\n", .{ i, ip, file_name, symbol_name });
-
-                            _ = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
-                        }
-                    }
-                }
+            // TODO: Get documentation on how exactly this first frame should be handled
+            if (ip == 0xfffffffffffffe00) {
                 ip_ix += 1;
                 continue;
             }
 
-            if (lookupAddress(regions.items, ip)) |region| {
-                const offset = region.offset + ip - region.start;
+            const lc_entry = try location_cache.getOrPut(init.gpa, ip);
+            if (!lc_entry.found_existing) {
+                if (lookupAddress(regions.items, ip)) |region| {
+                    const offset = region.offset + ip - region.start;
 
-                if (region.dwarf) |dwarf| {
-                    const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
-                    defer init.gpa.free(functions);
-                    if (functions.len == 0) {
-                        const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                        try location_cache.put(init.gpa, ip, .{ .elf_file = .{
-                            .name = elf_file,
-                            .offset = offset
-                        }});
+                    if (region.dwarf) |dwarf| {
+                        const functions = try lookupInlinedFunction(init.gpa, offset, &dwarf);
+                        defer init.gpa.free(functions);
 
-                        try writer.print("  {}: {s}@{x} (dwarf lookup failed)\n", .{ i, region.file_name, offset });
-
-                        const s = serialization.SampleData{
-                            .top = top,
-                            .known_file = true,
-                            .known_symbol = false,
-                            .was_inlined = false,
-                            .cpu = sample.cpu,
-                            .tid = sample.tid,
-                            .time_ns = sample.time_ns,
-                            .offset = offset,
-                            .elf_file = elf_file,
-                        };
-                        try sample_writer.writeSample(bwriter, s);
-                        top = false;
-                    } else {
-                        var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
-
-
-                        var fi: usize = functions.len;
-                        while (fi > 0) {
-                            fi -= 1;
-
-                            const f = functions[fi];
+                        if (functions.len == 0) {
                             const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                            const symbol_name = try sample_writer.addOrGet(init.gpa, f);
-
-                            inlined_cc[fi] = .{
-                                .file_name = elf_file,
-                                .name = symbol_name
+                            lc_entry.value_ptr.* = .{
+                                .elf_file = .{
+                                    .name = elf_file,
+                                    .offset = offset
+                                }
                             };
+                        } else {
+                            var inlined_cc = try inline_allocator.alloc(SymbolInfo, functions.len);
 
-                            if (fi == 0) {
-                                try writer.print("  {}: {s}:{s}\n", .{ i, region.file_name, f });
-                            } else {
-                                try writer.print("  {}: {s}:{s} (inlined)\n", .{ i, region.file_name, f });
+                            // TODO: Is this neccessary to do inverted? On the reader site it is inverted again...
+                            var fi: usize = functions.len;
+                            while (fi > 0) {
+                                fi -= 1;
+                                const f = functions[fi];
+                                const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                                const symbol_name = try sample_writer.addOrGet(init.gpa, f);
+
+                                inlined_cc[fi] = .{
+                                    .file_name = elf_file,
+                                    .name = symbol_name
+                                };
                             }
 
-                            const s = serialization.SampleData{
-                                .top = top,
-                                .known_file = true,
-                                .known_symbol = true,
-                                .was_inlined = fi == 0,
-                                .cpu = sample.cpu,
-                                .tid = sample.tid,
-                                .time_ns = sample.time_ns,
-                                .offset = offset,
-                                .elf_file = elf_file,
-                                .symbol_name = symbol_name,
-                            };
-                            try sample_writer.writeSample(bwriter, s);
-                            top = false;
+                            lc_entry.value_ptr.* = .{ .inlined_symbol = inlined_cc };
                         }
-
-                        try location_cache.put(init.gpa, ip, .{ .inlined_symbol = inlined_cc });
+                    } else {
+                        const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
+                        lc_entry.value_ptr.* = .{ 
+                            .elf_file = .{
+                                .name = elf_file,
+                                .offset = offset
+                            }
+                        };
                     }
                 } else {
-                    const elf_file = try sample_writer.addOrGet(init.gpa, region.file_name);
-                    try location_cache.put(init.gpa, ip, .{ .elf_file = .{
-                        .name = elf_file,
-                        .offset = offset
-                    }});
-
-                    try writer.print("  {}: {s}@{x}\n", .{ i, region.file_name, offset });
-                    const s = serialization.SampleData{
-                        .top = top,
-                        .known_file = true,
-                        .known_symbol = false,
-                        .was_inlined = false,
-                        .cpu = sample.cpu,
-                        .tid = sample.tid,
-                        .time_ns = sample.time_ns,
-                        .offset = offset,
-                        .elf_file = elf_file,
-                    };
-                    try sample_writer.writeSample(bwriter, s);
-                    top = false;
+                    lc_entry.value_ptr.* = .{ .address = ip };
                 }
-            } else {
-                // TODO: Get documentation on how exactly this first frame should be handled
-                if (ip != 0xfffffffffffffe00) {
-                    try location_cache.put(init.gpa, ip, .{ .address = ip });
+            }
 
-                    try writer.print("  {}: {x}\n", .{ i, ip });
-                    const s = serialization.SampleData{
-                        .top = top,
-                        .known_file = false,
-                        .known_symbol = false,
-                        .was_inlined = false,
-                        .cpu = sample.cpu,
-                        .tid = sample.tid,
-                        .time_ns = sample.time_ns,
-                        .offset = ip,
-                    };
-                    try sample_writer.writeSample(bwriter, s);
-                    top = false;
+            switch (lc_entry.value_ptr.*) {
+                .address => {
+                    try writer.print("  {}: {x}\n", .{ cc_i, ip });
+                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+
+                    cc_i += 1;
+                },
+                .elf_file => |file| {
+                    const name = sample_writer.get(file.name);
+                    try writer.print("  {}: {s}@{x}\n", .{ cc_i, name, file.offset });
+                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+
+                    cc_i += 1;
+                },
+                .symbol => |symbol| {
+                    const file_name = sample_writer.get(symbol.file_name);
+                    const symbol_name = sample_writer.get(symbol.name);
+                    try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
+                    _ = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
+
+                    cc_i += 1;
+                },
+                .inlined_symbol => |symbols| {
+                    var fi: usize = symbols.len;
+                    while (fi > 0) {
+                        fi -= 1;
+                        const symbol = symbols[fi];
+                        const file_name = sample_writer.get(symbol.file_name);
+                        const symbol_name = sample_writer.get(symbol.name);
+                        try writer.print("  {}: 0x{x} {s}:{s}\n", .{ cc_i, ip, file_name, symbol_name });
+
+                        _ = try locs.addOrGet(inline_allocator, .{ .symbol = symbol });
+
+                        cc_i += 1;
+                    }
                 }
             }
             ip_ix += 1;
@@ -621,9 +568,9 @@ pub fn main(init: std.process.Init) !void {
         try writer.print("\n", .{});
     }
 
-    var it = locs.hash_map.keyIterator();
+    var it = locs.hash_map.iterator();
     while (it.next()) |loc| {
-        std.debug.print("Unique location: {}\n", .{ loc });
+        std.debug.print("Unique location: {} -> {}\n", .{ loc.key_ptr, loc.value_ptr.* });
     }
     
 
