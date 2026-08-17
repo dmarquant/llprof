@@ -6,6 +6,74 @@ const StringTableEntry = @import("serialization.zig").StringTableEntry;
 const LocationType = @import("location_table.zig").LocationType;
 const Location = @import("location_table.zig").Location;
 
+const DefaultArrayList = @import("default_array_list.zig").DefaultArrayList;
+
+pub const CallchainNode = struct {
+    loc_ix: u32 = 0,
+
+    inclusive_count: u64 = 0,
+    exclusive_count: u64 = 0,
+
+    // index into the list of nodes
+    children: DefaultArrayList(u32, 8) = .empty,
+};
+
+pub const CallchainTree = struct {
+    node_list: std.ArrayList(CallchainNode) = .empty,
+
+    root_node: u32 = 0,
+
+    //arena: std.heap.ArenaAllocator,
+    allocator: std.mem.Allocator,
+
+    pub fn init(gpa: std.mem.Allocator) !CallchainTree {
+        var tree: CallchainTree = .{
+            .allocator = gpa,
+        };
+
+
+        try tree.node_list.append(tree.allocator, .{});
+        return tree;
+    }
+
+    pub fn deinit(tree: *CallchainTree) void {
+        _ = tree;
+        //tree.arena.deinit();
+    }
+
+    pub fn addNode(tree: *CallchainTree, parent: *CallchainNode, loc_ix: u32) !*CallchainNode {
+        try tree.node_list.append(tree.allocator, .{ .loc_ix = loc_ix });
+        try parent.children.append(tree.allocator, @intCast(tree.node_list.items.len - 1));
+        return &tree.node_list.items[tree.node_list.items.len - 1];
+    }
+
+    pub fn addCallchain(tree: *CallchainTree, locations: []u32) !void {
+        var node = &tree.node_list.items[0];
+        node.inclusive_count += 1;
+
+        var ix = locations.len;
+        while (ix > 0) {
+            ix -= 1;
+
+            var next_node: ?*CallchainNode = null;
+            for (node.children.items()) |child| {
+                if (tree.node_list.items[child].loc_ix == locations[ix]) {
+                    next_node = &tree.node_list.items[child];
+                    break;
+                }
+            }
+
+            node = next_node orelse try tree.addNode(node, locations[ix]);
+            if (ix == 0) {
+                node.exclusive_count += 1;
+            }
+            node.inclusive_count += 1;
+        }
+    }
+};
+
+
+
 /// Load binary samples into machine readable format.
 ///
 fn readStringTableEntry(reader: *std.Io.Reader) !StringTableEntry {
@@ -19,6 +87,23 @@ fn readStringTableEntry(reader: *std.Io.Reader) !StringTableEntry {
 
 fn lookupString(st: []const u8, entry: StringTableEntry) []const u8 {
     return st[entry.offset .. entry.offset + entry.len];
+}
+
+fn printLocation(loc: Location, string_table: []const u8) void {
+    switch (loc) {
+        .elf_file => |elf_file| {
+            const name = lookupString(string_table, elf_file.name);
+            std.debug.print("{s}@{x}\n", .{ name, elf_file.offset });
+        },
+        .symbol => |symbol| {
+            const file_name = lookupString(string_table, symbol.file_name);
+            const name = lookupString(string_table, symbol.name);
+            std.debug.print("{s}:{s}\n", .{ file_name, name });
+        },
+        .address => |address| {
+            std.debug.print("0x{x}\n", .{ address });
+        }
+    }
 }
 
 pub fn readSamples(reader: *std.Io.Reader, arena: std.mem.Allocator) !void {
@@ -84,32 +169,29 @@ pub fn readSamples(reader: *std.Io.Reader, arena: std.mem.Allocator) !void {
         locations[i] = try reader.takeInt(u32, .little);
     }
 
-    var f: usize = 0;
-    for (0 .. 30) |i| {
-        std.debug.print("{},{},{}\n", .{ samples[i].cpu, samples[i].tid, samples[i].time_ns });
 
-        for (0 .. samples[i].num_frames) |cf| {
-            const loc = location_table.items[locations[f]];
-            switch (loc) {
-                .elf_file => |elf_file| {
-                    const name = lookupString(string_table, elf_file.name);
-                    std.debug.print("  {}: {s}@{x} ({})\n", .{ cf, name, elf_file.offset, locations[f] });
-                },
-                .symbol => |symbol| {
-                    const file_name = lookupString(string_table, symbol.file_name);
-                    const name = lookupString(string_table, symbol.name);
-                    std.debug.print("  {}: {s}:{s} ({})\n", .{ cf, file_name, name, locations[f] });
-                },
-                .address => |address| {
-                    std.debug.print("  {}: 0x{x}\n", .{ cf, address });
-                }
-            }
-            f += 1;
-        }
+    var cc_tree = try CallchainTree.init(arena);
+    defer cc_tree.deinit();
+
+    var loc_start: usize = 0;
+    for (samples) |sample| {
+        const location_ixs = locations[loc_start .. loc_start + sample.num_frames];
+        try cc_tree.addCallchain(location_ixs);
+
+        loc_start += sample.num_frames;
     }
 
-    const rest = try reader.allocRemaining(arena, .unlimited);
-    std.debug.print("The rest has size: {}\n", .{ rest.len });
+    // TODO: Properly walk the tree
+    var node = &cc_tree.node_list.items[0];
+    while (true) {
+        if (node.children.items().len == 0) {
+            break;
+        }
+        node = &cc_tree.node_list.items[node.children.items()[0]];
+
+        std.debug.print("{} - ", .{ node. inclusive_count });
+        printLocation(location_table.items[node.loc_ix], string_table);
+    }
 }
 
 pub fn main(init: std.process.Init) !void {

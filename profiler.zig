@@ -524,7 +524,7 @@ pub fn main(init: std.process.Init) !void {
 
             switch (lc_entry.value_ptr.*) {
                 .address => {
-                    try writer.print("  {}: {x}\n", .{ cc_i, ip });
+                    try writer.print("  {}: 0x{x}\n", .{ cc_i, ip });
                     const loc_ix = try locs.addOrGet(inline_allocator, lc_entry.value_ptr.toLocation());
                     try location_list.append(init.gpa, loc_ix);
 
