@@ -73,12 +73,6 @@ pub const CallchainTree = struct {
 };
 
 
-const TreeWalkItem = struct {
-    node: *CallchainNode,
-    child_ix: u32 = 0,
-};
-
-
 /// Load binary samples into machine readable format.
 ///
 fn readStringTableEntry(reader: *std.Io.Reader) !StringTableEntry {
@@ -90,97 +84,114 @@ fn readStringTableEntry(reader: *std.Io.Reader) !StringTableEntry {
     };
 }
 
-fn lookupString(st: []const u8, entry: StringTableEntry) []const u8 {
-    return st[entry.offset .. entry.offset + entry.len];
-}
+pub const Samples = struct {
+    string_table: []const u8,
+    location_table: []const Location,
+    samples: []SampleData,
+    locations: []u32,
 
-fn printLocation(loc: Location, string_table: []const u8) void {
-    switch (loc) {
-        .elf_file => |elf_file| {
-            const name = lookupString(string_table, elf_file.name);
-            std.debug.print("{s}@{x}\n", .{ name, elf_file.offset });
-        },
-        .symbol => |symbol| {
-            const file_name = lookupString(string_table, symbol.file_name);
-            const name = lookupString(string_table, symbol.name);
-            std.debug.print("{s}:{s}\n", .{ file_name, name });
-        },
-        .address => |address| {
-            std.debug.print("0x{x}\n", .{ address });
+    pub fn read(reader: *std.Io.Reader, arena: std.mem.Allocator) !Samples {
+        const major = try reader.takeInt(u16, .little);
+        const minor = try reader.takeInt(u16, .little);
+        if (major != 0 or minor != 2) {
+            return error.UnsupportedVersion;
         }
+
+        const string_table_bytes = try reader.takeInt(u32, .little);
+        const location_table_length = try reader.takeInt(u32, .little);
+        const num_samples = try reader.takeInt(u64, .little);
+        const num_locations = try reader.takeInt(u64, .little);
+
+        const string_table = try reader.readAlloc(arena, string_table_bytes);
+        var location_table = try arena.alloc(Location, location_table_length);
+
+        for (0 .. location_table_length) |i| {
+            const first_byte = try reader.takeByte();
+            const location_type: LocationType = @enumFromInt(first_byte);
+
+            switch (location_type) {
+                .address => {
+                    location_table[i] = .{ .address = try reader.takeInt(u64, .little) };
+                },
+                .elf_file => {
+                    const name = try readStringTableEntry(reader);
+                    const offset = try reader.takeInt(u64, .little);
+                    location_table[i] = .{ 
+                        .elf_file = .{ 
+                            .name = name,
+                            .offset = offset,
+                        }
+                    };
+                },
+                .symbol => {
+                    const file_name = try readStringTableEntry(reader);
+                    const name = try readStringTableEntry(reader);
+                    location_table[i] = .{ 
+                        .symbol = .{ 
+                            .file_name = file_name,
+                            .name = name,
+                        }
+                    };
+                }
+            }
+        }
+
+        const samples = try arena.alloc(SampleData, num_samples);
+        for (0 .. num_samples) |i| {
+            samples[i].time_ns = try reader.takeInt(u64, .little);
+            samples[i].cpu = try reader.takeInt(u32, .little);
+            samples[i].tid = try reader.takeInt(u32, .little);
+            samples[i].num_frames = try reader.takeInt(u32, .little);
+        }
+
+        const locations = try arena.alloc(u32, num_locations);
+        for (0 .. num_locations) |i| {
+            locations[i] = try reader.takeInt(u32, .little);
+        }
+
+        return .{
+            .string_table = string_table,
+            .location_table = location_table,
+            .samples = samples,
+            .locations = locations
+        };
     }
-}
 
-pub fn readSamples(reader: *std.Io.Reader, arena: std.mem.Allocator) !void {
-    const major = try reader.takeInt(u16, .little);
-    const minor = try reader.takeInt(u16, .little);
-    if (major != 0 or minor != 2) {
-        return error.UnsupportedVersion;
-    }
-
-    const string_table_bytes = try reader.takeInt(u32, .little);
-    const location_table_length = try reader.takeInt(u32, .little);
-    const num_samples = try reader.takeInt(u64, .little);
-    const num_locations = try reader.takeInt(u64, .little);
-
-    std.debug.print("Reading {} samples and {} locations\n", .{ num_samples, num_locations });
-
-    const string_table = try reader.readAlloc(arena, string_table_bytes);
-
-    // TODO: This can be fixed size...
-    var location_table: std.ArrayList(Location) = .empty;
-
-    for (0 .. location_table_length) |_| {
-        const first_byte = try reader.takeByte();
-        const location_type: LocationType = @enumFromInt(first_byte);
-
-        switch (location_type) {
-            .address => {
-                try location_table.append(arena, .{ .address = try reader.takeInt(u64, .little) });
+    pub fn printLocation(self: *const Samples, loc_ix: u32) void {
+        const loc = self.location_table[loc_ix];
+        switch (loc) {
+            .elf_file => |elf_file| {
+                const name = self.lookupString(elf_file.name);
+                std.debug.print("{s}@{x}\n", .{ name, elf_file.offset });
             },
-            .elf_file => {
-                const name = try readStringTableEntry(reader);
-                const offset = try reader.takeInt(u64, .little);
-                try location_table.append(arena, .{ 
-                    .elf_file = .{ 
-                        .name = name,
-                        .offset = offset,
-                    }
-                });
+            .symbol => |symbol| {
+                const file_name = self.lookupString(symbol.file_name);
+                const name = self.lookupString(symbol.name);
+                std.debug.print("{s}:{s}\n", .{ file_name, name });
             },
-            .symbol => {
-                const file_name = try readStringTableEntry(reader);
-                const name = try readStringTableEntry(reader);
-                try location_table.append(arena, .{ 
-                    .symbol = .{ 
-                        .file_name = file_name,
-                        .name = name,
-                    }
-                });
+            .address => |address| {
+                std.debug.print("0x{x}\n", .{ address });
             }
         }
     }
 
-    const samples = try arena.alloc(SampleData, num_samples);
-    for (0 .. num_samples) |i| {
-        samples[i].time_ns = try reader.takeInt(u64, .little);
-        samples[i].cpu = try reader.takeInt(u32, .little);
-        samples[i].tid = try reader.takeInt(u32, .little);
-        samples[i].num_frames = try reader.takeInt(u32, .little);
+    fn lookupString(self: *const Samples, entry: StringTableEntry) []const u8 {
+        return self.string_table[entry.offset .. entry.offset + entry.len];
     }
+};
 
-    const locations = try arena.alloc(u32, num_locations);
-    for (0 .. num_locations) |i| {
-        locations[i] = try reader.takeInt(u32, .little);
-    }
+const TreeWalkItem = struct {
+    node: *CallchainNode,
+    child_ix: u32 = 0,
+};
 
-
+pub fn printCallchainTree(samples: *const Samples, arena: std.mem.Allocator) !void {
     var cc_tree = try CallchainTree.init(arena);
     defer cc_tree.deinit();
 
     var loc_start: usize = 0;
-    for (samples) |sample| {
-        const location_ixs = locations[loc_start .. loc_start + sample.num_frames];
+    for (samples.samples) |sample| {
+        const location_ixs = samples.locations[loc_start .. loc_start + sample.num_frames];
         try cc_tree.addCallchain(location_ixs);
 
         loc_start += sample.num_frames;
@@ -205,8 +216,7 @@ pub fn readSamples(reader: *std.Io.Reader, arena: std.mem.Allocator) !void {
             });
 
             std.debug.print("{} - ", .{ child.inclusive_count });
-            printLocation(location_table.items[child.loc_ix], string_table);
-
+            samples.printLocation(child.loc_ix);
 
             item.child_ix += 1;
         } else {
@@ -225,6 +235,8 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
 
-    try readSamples(&samples_reader.interface, arena.allocator());
+    const samples = try Samples.read(&samples_reader.interface, arena.allocator());
+
+    try printCallchainTree(&samples, arena.allocator());
 }
 

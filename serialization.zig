@@ -31,7 +31,7 @@ pub const StringTableEntry = struct {
     len: u32,
 };
 
-pub const SampleData = struct {
+pub const SampleData = extern struct {
     time_ns: u64 = 0,
     cpu: u32 = 0,
     tid: u32 = 0,
