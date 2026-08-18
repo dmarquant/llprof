@@ -40,7 +40,11 @@ pub fn DefaultArrayList(comptime T: type, comptime FixedSize: usize) type {
             }
         }
 
-        pub fn items(al: *const Self) []const T {
+        pub fn len(al: *Self) usize {
+            return al.items().len;
+        }
+
+        pub fn items(al: *Self) []T {
             switch (al.storage) {
                 .fixed => |*fixed| {
                     return fixed.data[0 .. fixed.len];
@@ -50,6 +54,29 @@ pub fn DefaultArrayList(comptime T: type, comptime FixedSize: usize) type {
                 }
             }
         }
+
+        pub fn topPtr(al: *Self) *T {
+            std.debug.assert(al.items().len > 0);
+
+            return &al.items()[al.items().len-1];
+        }
+
+        pub fn pop(al: *Self) ?T {
+            if (al.items().len < 1)
+                return null;
+
+            switch (al.storage) {
+                .fixed => |*fixed| {
+                    fixed.len -= 1;
+                    return fixed.data[fixed.len];
+                },
+                .allocated => |*allocated| {
+                    return allocated.pop();
+                }
+            }
+
+        }
+
 
         pub fn ensureTotalCapacity(al: *Self, gpa: std.mem.Allocator, new_capacity: usize) !void {
             switch (al.storage) {

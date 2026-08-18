@@ -73,6 +73,11 @@ pub const CallchainTree = struct {
 };
 
 
+const TreeWalkItem = struct {
+    node: *CallchainNode,
+    child_ix: u32 = 0,
+};
+
 
 /// Load binary samples into machine readable format.
 ///
@@ -181,16 +186,32 @@ pub fn readSamples(reader: *std.Io.Reader, arena: std.mem.Allocator) !void {
         loc_start += sample.num_frames;
     }
 
-    // TODO: Properly walk the tree
-    var node = &cc_tree.node_list.items[0];
-    while (true) {
-        if (node.children.items().len == 0) {
-            break;
-        }
-        node = &cc_tree.node_list.items[node.children.items()[0]];
 
-        std.debug.print("{} - ", .{ node. inclusive_count });
-        printLocation(location_table.items[node.loc_ix], string_table);
+    var walk_stack: DefaultArrayList(TreeWalkItem, 128) = .empty;
+    try walk_stack.append(arena, .{
+        .node = &cc_tree.node_list.items[0],
+    });
+
+    while (walk_stack.len() > 0) {
+        const item = walk_stack.topPtr();
+        if (item.child_ix < item.node.children.len()) {
+            for (1 .. walk_stack.len()) |_| {
+                std.debug.print("  ", .{});
+            }
+
+            const child = &cc_tree.node_list.items[item.node.children.items()[item.child_ix]];
+            try walk_stack.append(arena, .{
+                .node = child,
+            });
+
+            std.debug.print("{} - ", .{ child.inclusive_count });
+            printLocation(location_table.items[child.loc_ix], string_table);
+
+
+            item.child_ix += 1;
+        } else {
+            _ = walk_stack.pop();
+        }
     }
 }
 
