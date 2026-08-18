@@ -198,25 +198,35 @@ pub fn printCallchainTree(samples: *const Samples, arena: std.mem.Allocator) !vo
     }
 
 
+    const root_node = &cc_tree.node_list.items[0];
+
+    const total_inclusive_count = root_node.inclusive_count;
+    
     var walk_stack: DefaultArrayList(TreeWalkItem, 128) = .empty;
+    defer walk_stack.deinit(arena);
+
     try walk_stack.append(arena, .{
-        .node = &cc_tree.node_list.items[0],
+        .node = root_node,
     });
 
     while (walk_stack.len() > 0) {
         const item = walk_stack.topPtr();
         if (item.child_ix < item.node.children.len()) {
-            for (1 .. walk_stack.len()) |_| {
-                std.debug.print("  ", .{});
-            }
 
             const child = &cc_tree.node_list.items[item.node.children.items()[item.child_ix]];
             try walk_stack.append(arena, .{
                 .node = child,
             });
 
-            std.debug.print("{} - ", .{ child.inclusive_count });
-            samples.printLocation(child.loc_ix);
+            const inclusive_pct: f64 = @as(f64, @floatFromInt(child.inclusive_count))/@as(f64, @floatFromInt(total_inclusive_count)) * 100.0;
+
+            if (inclusive_pct > 0.05) {
+                for (2 .. walk_stack.len()) |_| {
+                    std.debug.print("  ", .{});
+                }
+                std.debug.print("{d:.2} - ", .{ inclusive_pct });
+                samples.printLocation(child.loc_ix);
+            }
 
             item.child_ix += 1;
         } else {
