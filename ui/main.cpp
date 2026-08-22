@@ -1,6 +1,7 @@
 #include <QByteArray>
 #include <QDebug>
 #include <QFile>
+#include <QApplication>
 
 struct StringTableEntry {
   uint32_t offset;
@@ -35,32 +36,35 @@ struct Sample {
   uint32_t numFrames;
 };
 
-struct SampleCount {
-  uint64_t exclusive = 0;
-  uint64_t inclusive = 0;
+struct Samples {
+  QByteArray stringTable;
+  QVector<Location> locationTable;
+  QVector<Sample> samples;
+  QVector<uint32_t> locations;
+
+  QString locationToString(uint32_t ix) {
+    Location loc = locationTable[ix];
+    if (loc.type == Address) {
+      return QString("0x%1").arg(loc.address, 0, 16);
+    } else if (loc.type == ElfFile) {
+      auto name = stringTable.sliced(loc.elfFile.name.offset, loc.elfFile.name.len);
+      return QString("%1@%2").arg(name).arg(loc.elfFile.offset, 0, 16);
+      qDebug() << ' ' << name << '@' << loc.elfFile.offset;
+    } else if (loc.type == Symbol) {
+      auto fileName = stringTable.sliced(loc.symbol.fileName.offset, loc.symbol.fileName.len);
+      auto name = stringTable.sliced(loc.symbol.name.offset, loc.symbol.name.len);
+      return QString("%1:%2").arg(fileName).arg(name);
+    } else {
+      return QString("Invalid location");
+    }
+  }
 };
 
-QString toString(const QByteArray& stringTable, const Location& loc) {
-  if (loc.type == Address) {
-    return QString("0x%1").arg(loc.address, 0, 16);
-  } else if (loc.type == ElfFile) {
-    auto name = stringTable.sliced(loc.elfFile.name.offset, loc.elfFile.name.len);
-    return QString("%1@%2").arg(name).arg(loc.elfFile.offset, 0, 16);
-    qDebug() << ' ' << name << '@' << loc.elfFile.offset;
-  } else if (loc.type == Symbol) {
-    auto fileName = stringTable.sliced(loc.symbol.fileName.offset, loc.symbol.fileName.len);
-    auto name = stringTable.sliced(loc.symbol.name.offset, loc.symbol.name.len);
-    return QString("%1:%2").arg(fileName).arg(name);
-  } else {
-    return QString("Invalid location");
-  }
-}
-
-int main(int argc, char** argv) {
+Samples loadSamples(const QString& fileName) {
   QFile file("samples.bin");
   if (!file.open(QIODeviceBase::ReadOnly)) {
     qDebug() << "Failed to open samples";
-    return -1;
+    exit(-1);
   }
 
   QDataStream stream(&file);
@@ -92,7 +96,7 @@ int main(int argc, char** argv) {
       stream >> location.symbol.name.len;
     } else {
       qDebug() << "Unexpected location type!" << location.type;
-      return -1;
+      exit(-1);
     }
   }
 
@@ -106,26 +110,27 @@ int main(int argc, char** argv) {
     stream >> loc;
   }
 
-  QHash<uint32_t, SampleCount> sampleCounts;
-
-  int loci = 0;
-  for (const Sample& sample : samples) {
-    int locend = loci + sample.numFrames - 1;
-    for (; locend >= loci; locend--) {
-      uint32_t loc_ix = locations[locend];
-      auto& entry = sampleCounts[loc_ix];
-      if (locend == loci) {
-        entry.exclusive++;
-      }
-      entry.inclusive++;
-    }
-      
-    loci += sample.numFrames;
-  }
-
-  for (auto entry = sampleCounts.cbegin(), end = sampleCounts.cend(); entry != end; ++entry) {
-    Location loc = locationTable[entry.key()];
-    SampleCount count = entry.value();
-    qDebug() << count.exclusive << count.inclusive << toString(stringTable, loc);
-  }
+  Samples loaded;
+  loaded.stringTable = std::move(stringTable);
+  loaded.locationTable = std::move(locationTable);
+  loaded.samples = std::move(samples);
+  loaded.locations = std::move(locations);
+  return loaded;
 }
+
+#include "FunctionListModel.h"
+#include "FunctionList.h"
+
+int main(int argc, char** argv) {
+  Samples samples = loadSamples("samples.bin");
+
+  QApplication app(argc, argv);
+
+  FunctionList list;
+  list.setSampleData(&samples);
+  list.show();
+
+  return app.exec();
+}
+
+#include "moc.cpp"

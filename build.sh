@@ -7,6 +7,7 @@ zig build-lib capi.zig -fPIC
 gcc test_consumer.c -o test_consumer libcapi.a
 
 
+cat ui/FunctionList.h ui/FunctionListModel.h | /usr/lib/qt6/libexec/moc > ui/moc.cpp
 clang++ ui/main.cpp -o profiler_ui \
   -I/usr/include/x86_64-linux-gnu/qt6 \
   -I/usr/include/x86_64-linux-gnu/qt6/QtCore \
